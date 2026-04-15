@@ -9,6 +9,8 @@ A universal bash script to install, configure, and manage a Hysteria 2 VPN serve
 * Certificates: Choose between Let's Encrypt (domain required) or an auto-generated self-signed certificate bound to your server's IP.
 * Client Management: Add, list, and delete clients. Automatically generates configuration files, sharing links, and QR codes for the terminal.
 * Bypass Restrictions: Built-in configuration for Salamander obfuscation and website masquerading.
+* Port Hopping: Bypass aggressive UDP blocking and QoS by listening on a wide range of ports simultaneously with your main port.
+* Smart Firewall Management: Native, clean integration with both `iptables` and `nftables`. Port forwarding rules are dynamically applied and safely removed alongside the `systemd` service lifecycle.
 * Congestion Control: Select between Hysteria Brutal, BBR, or Reno for each client.
 * In-place Updates: Check for and install the latest Hysteria 2 core updates directly from the official repository without losing your configurations.
 
@@ -22,4 +24,4 @@ chmod +x hysteria-install.sh
 ./hysteria-install.sh
 ```
 
-After installation, use `hysteria-install.sh` to manage Hysteria2.
+After installation, use `./hysteria-install.sh` to manage Hysteria2.
