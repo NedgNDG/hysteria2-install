@@ -36,19 +36,26 @@ detect_arch() {
 }
 
 install_deps() {
-    echo -e "${GREEN}Checking dependencies...${NC}"
-    if [ -x "$(command -v apt-get)" ]; then
-        apt-get update && apt-get install -y curl wget openssl qrencode jq
-    elif [ -x "$(command -v dnf)" ]; then
-        dnf install -y curl wget openssl qrencode jq
-    elif [ -x "$(command -v yum)" ]; then
-        yum install -y curl wget openssl epel-release qrencode jq
-    elif [ -x "$(command -v pacman)" ]; then
-        pacman -Sy --noconfirm curl wget openssl qrencode jq
-    elif [ -x "$(command -v zypper)" ]; then
-        zypper install -y curl wget openssl qrencode jq
+    echo -e "${GREEN}Checking and installing missing dependencies...${NC}"
+    local FW_PKG=""
+    if [[ "$FIREWALL_BACKEND" == "nftables" ]]; then
+        FW_PKG="nftables"
     else
-        echo -e "${RED}Unsupported package manager. Please install curl, wget, jq, openssl, and qrencode manually.${NC}"
+        FW_PKG="iptables"
+    fi
+
+    if [ -x "$(command -v apt-get)" ]; then
+        apt-get update && apt-get install -y curl openssl qrencode jq $FW_PKG
+    elif [ -x "$(command -v dnf)" ]; then
+        dnf install -y curl openssl qrencode jq $FW_PKG
+    elif [ -x "$(command -v yum)" ]; then
+        yum install -y curl openssl epel-release qrencode jq $FW_PKG
+    elif [ -x "$(command -v pacman)" ]; then
+        pacman -Sy --noconfirm curl openssl qrencode jq $FW_PKG
+    elif [ -x "$(command -v zypper)" ]; then
+        zypper install -y curl openssl qrencode jq $FW_PKG
+    else
+        echo -e "${RED}Unsupported package manager. Please install curl, jq, openssl, qrencode, and $FW_PKG manually.${NC}"
         exit 1
     fi
 }
@@ -105,6 +112,51 @@ tls:
   key: ${HYSTERIA_DIR}/server.key
 EOF
     fi
+
+    cat <<EOF > /etc/systemd/system/hysteria.service
+[Unit]
+Description=Hysteria 2 Service
+After=network.target
+
+[Service]
+EOF
+
+    if [[ -n "$FIREWALL_BACKEND" ]]; then
+        echo "Environment=\"HYSTERIA_FIREWALL_BACKEND=$FIREWALL_BACKEND\"" >> /etc/systemd/system/hysteria.service
+    fi
+
+    # Добавляем правила перенаправления портов, если задан HOP_RANGE
+    if [[ -n "$HOP_RANGE" ]]; then
+        if [[ "$FIREWALL_BACKEND" == "nftables" ]]; then
+            local NFT_CMD=$(command -v nft)
+            cat <<EOF >> /etc/systemd/system/hysteria.service
+ExecStartPre=+${NFT_CMD} add table ip hysteria_nat
+ExecStartPre=+${NFT_CMD} add chain ip hysteria_nat prerouting { type nat hook prerouting priority dstnat \; }
+ExecStartPre=+${NFT_CMD} add rule ip hysteria_nat prerouting udp dport $HOP_RANGE counter redirect to :$PORT
+ExecStopPost=+${NFT_CMD} delete table ip hysteria_nat
+EOF
+        else
+            local IPTABLES_CMD=$(command -v iptables)
+            local IPT_RANGE=${HOP_RANGE//-/:} # Заменяем тире на двоеточие для синтаксиса iptables
+            cat <<EOF >> /etc/systemd/system/hysteria.service
+ExecStartPre=+${IPTABLES_CMD} -t nat -A PREROUTING -p udp --dport $IPT_RANGE -j REDIRECT --to-ports $PORT
+ExecStopPost=+${IPTABLES_CMD} -t nat -D PREROUTING -p udp --dport $IPT_RANGE -j REDIRECT --to-ports $PORT
+EOF
+        fi
+    fi
+
+    cat <<EOF >> /etc/systemd/system/hysteria.service
+ExecStart=$BIN_PATH server -c $CONFIG_FILE
+WorkingDirectory=$HYSTERIA_DIR
+Restart=always
+User=root
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
     systemctl restart hysteria
 }
 
@@ -114,16 +166,34 @@ install_hysteria() {
     echo -e "${GREEN}Detected architecture: ${ARCH}${NC}"
     
     SERVER_IP=$(get_public_ip)
-    read -p "Server Port [443] (0 to cancel): " PORT
-    if [[ "$PORT" == "0" ]]; then exit 0; fi
+    
+    read -p "Main Server Port (e.g. 443) [443]: " PORT
     PORT=${PORT:-443}
+
+    echo -e "\n${YELLOW}Port Hopping allows you to bypass UDP blocking by listening on a range of ports.${NC}"
+    read -p "Add a Port Hopping range? [y/N]: " ENABLE_HOPPING
+    if [[ "$ENABLE_HOPPING" =~ ^[Yy]$ ]]; then
+        read -p "Enter port range (e.g., 20000-50000): " HOP_RANGE
+        HOP_RANGE=${HOP_RANGE:-20000-50000}
+        
+        echo -e "\nWhich firewall backend to use for port forwarding?"
+        echo "1) iptables (usually older OS or CentOS/Alma)"
+        echo "2) nftables (modern Debian/Ubuntu)"
+        read -p "Choice [1-2]: " FW_CHOICE
+        if [[ "$FW_CHOICE" == "2" ]]; then
+            FIREWALL_BACKEND="nftables"
+        else
+            FIREWALL_BACKEND="iptables"
+        fi
+    else
+        HOP_RANGE=""
+        FIREWALL_BACKEND=""
+    fi
 
     echo -e "\nCertificate Type:"
     echo "1) Let's Encrypt (Domain)"
     echo "2) Self-Signed (Using Server IP: $SERVER_IP)"
-    echo "0) Cancel"
     read -p "Choice [1-2]: " CERT_CHOICE
-    if [[ "$CERT_CHOICE" == "0" ]]; then exit 0; fi
 
     if [[ "$CERT_CHOICE" == "1" ]]; then
         read -p "Enter domain: " DOMAIN
@@ -156,7 +226,7 @@ install_hysteria() {
     install_deps
     
     echo -e "${GREEN}Downloading Hysteria 2 for linux-${ARCH}...${NC}"
-    wget -qO $BIN_PATH "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${ARCH}"
+    curl -fSL -o $BIN_PATH "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-${ARCH}"
     chmod +x $BIN_PATH
     mkdir -p $HYSTERIA_DIR $CLIENTS_DIR
 
@@ -169,6 +239,7 @@ install_hysteria() {
     cat <<EOF > $SETTINGS_FILE
 SERVER_ADDR=$SERVER_ADDR
 PORT=$PORT
+HOP_RANGE=$HOP_RANGE
 PASSWORD=$PASSWORD
 INSECURE_FLAG=$INSECURE_FLAG
 SNI=$SNI
@@ -176,24 +247,11 @@ OBFS_ENABLED=$OBFS_ENABLED
 OBFS_PASSWORD=$OBFS_PASSWORD
 MASQ_DOMAIN=$MASQ_DOMAIN
 CERT_TYPE=$CERT_TYPE
+FIREWALL_BACKEND=$FIREWALL_BACKEND
 EOF
 
     save_server_config
     
-    cat <<EOF > /etc/systemd/system/hysteria.service
-[Unit]
-Description=Hysteria 2 Service
-After=network.target
-[Service]
-ExecStart=$BIN_PATH server -c $CONFIG_FILE
-WorkingDirectory=$HYSTERIA_DIR
-Restart=always
-User=root
-LimitNOFILE=1048576
-[Install]
-WantedBy=multi-user.target
-EOF
-    systemctl daemon-reload
     systemctl enable hysteria
     systemctl start hysteria
     
@@ -204,11 +262,9 @@ EOF
 update_hysteria() {
     echo -e "\n${BLUE}--- Core Update ---${NC}"
     
-    # Extract current version (format: "app version X.Y.Z")
     CURRENT_VER=$($BIN_PATH -v | grep "version" | awk '{print $3}')
     echo -e "Current version: ${YELLOW}$CURRENT_VER${NC}"
 
-    # Fetch latest release tag from GitHub API
     echo "Checking for updates on GitHub..."
     LATEST_VER=$(curl -s https://api.github.com/repos/apernet/hysteria/releases/latest | grep -o '"tag_name": "[^"]*' | grep -o '[^"]*$')
 
@@ -230,7 +286,7 @@ update_hysteria() {
         echo -e "${GREEN}Downloading version $LATEST_VER for linux-${ARCH}...${NC}"
         
         systemctl stop hysteria
-        wget -qO $BIN_PATH "https://github.com/apernet/hysteria/releases/download/${LATEST_VER}/hysteria-linux-${ARCH}"
+        curl -fSL -o $BIN_PATH "https://github.com/apernet/hysteria/releases/download/${LATEST_VER}/hysteria-linux-${ARCH}"
         chmod +x $BIN_PATH
         systemctl start hysteria
         
@@ -257,8 +313,14 @@ add_client() {
 
     CLIENT_CONFIG_FILE="${CLIENTS_DIR}/${CLIENT_NAME}.yaml"
     
+    # Формируем строку портов. Если есть HOP_RANGE, то это "443,20000-50000"
+    local CLIENT_PORTS="$PORT"
+    if [[ -n "$HOP_RANGE" ]]; then
+        CLIENT_PORTS="${PORT},${HOP_RANGE}"
+    fi
+    
     cat <<EOF > $CLIENT_CONFIG_FILE
-server: $SERVER_ADDR:$PORT
+server: $SERVER_ADDR:$CLIENT_PORTS
 auth: $PASSWORD
 tls:
   sni: $SNI
@@ -266,7 +328,7 @@ tls:
 fastOpen: true
 EOF
 
-    HY2_LINK="hy2://${PASSWORD}@${SERVER_ADDR}:${PORT}/?insecure=${INSECURE_FLAG}&sni=${SNI}"
+    HY2_LINK="hy2://${PASSWORD}@${SERVER_ADDR}:${CLIENT_PORTS}/?insecure=${INSECURE_FLAG}&sni=${SNI}"
 
     case $CC_CHOICE in
         1)
@@ -370,63 +432,106 @@ delete_client() {
 modify_settings() {
     source $SETTINGS_FILE
     echo -e "\n${BLUE}--- Server Settings ---${NC}"
-    echo "1) Change Port ($PORT)"
-    echo "2) Change Masquerade ($MASQ_DOMAIN)"
-    echo "3) Toggle Obfuscation ($OBFS_ENABLED)"
+    echo "1) Change Main Port ($PORT)"
+    echo "2) Toggle/Change Port Hopping Range (${HOP_RANGE:-Disabled})"
+    echo "3) Change Masquerade ($MASQ_DOMAIN)"
+    echo "4) Toggle Obfuscation ($OBFS_ENABLED)"
     echo "0) Back"
     read -p "Choice: " MOD_CHOICE
     
     case $MOD_CHOICE in
-        1) read -p "New Port: " PORT; sed -i "s/PORT=.*/PORT=$PORT/" $SETTINGS_FILE ;;
-        2) read -p "New Masquerade: " MASQ_DOMAIN; sed -i "s/MASQ_DOMAIN=.*/MASQ_DOMAIN=$MASQ_DOMAIN/" $SETTINGS_FILE ;;
-        3) 
+        1) 
+           read -p "New Main Port (e.g. 443): " NEW_PORT
+           if [[ -n "$NEW_PORT" ]]; then
+               sed -i "s/^PORT=.*/PORT=$NEW_PORT/" $SETTINGS_FILE
+               PORT=$NEW_PORT
+           fi
+           ;;
+        2) 
+           echo -e "\n${YELLOW}Current Range: ${HOP_RANGE:-None}${NC}"
+           read -p "Enter new range (e.g., 20000-50000) or '0' to disable: " NEW_RANGE
+           if [[ "$NEW_RANGE" == "0" ]]; then
+               sed -i "s/^HOP_RANGE=.*/HOP_RANGE=/" $SETTINGS_FILE
+               HOP_RANGE=""
+           elif [[ -n "$NEW_RANGE" && "$NEW_RANGE" == *-* ]]; then
+               if grep -q "^HOP_RANGE=" $SETTINGS_FILE; then
+                   sed -i "s/^HOP_RANGE=.*/HOP_RANGE=$NEW_RANGE/" $SETTINGS_FILE
+               else
+                   echo "HOP_RANGE=$NEW_RANGE" >> $SETTINGS_FILE
+               fi
+               HOP_RANGE=$NEW_RANGE
+               
+               echo -e "\nWhich firewall backend to use?"
+               echo "1) iptables"
+               echo "2) nftables"
+               read -p "Choice [1-2]: " FW_CHOICE
+               if [[ "$FW_CHOICE" == "2" ]]; then
+                   NEW_FW="nftables"
+                   CMD_CHECK="nft"
+               else
+                   NEW_FW="iptables"
+                   CMD_CHECK="iptables"
+               fi
+               
+               if grep -q "^FIREWALL_BACKEND=" $SETTINGS_FILE; then
+                   sed -i "s/^FIREWALL_BACKEND=.*/FIREWALL_BACKEND=$NEW_FW/" $SETTINGS_FILE
+               else
+                   echo "FIREWALL_BACKEND=$NEW_FW" >> $SETTINGS_FILE
+               fi
+               FIREWALL_BACKEND=$NEW_FW
+               
+               if ! command -v $CMD_CHECK >/dev/null 2>&1; then install_deps; fi
+           fi
+           ;;
+        3) read -p "New Masquerade: " MASQ_DOMAIN; sed -i "s/^MASQ_DOMAIN=.*/MASQ_DOMAIN=$MASQ_DOMAIN/" $SETTINGS_FILE ;;
+        4) 
            if [[ "$OBFS_ENABLED" == "true" ]]; then
-               sed -i "s/OBFS_ENABLED=.*/OBFS_ENABLED=false/" $SETTINGS_FILE
+               sed -i "s/^OBFS_ENABLED=.*/OBFS_ENABLED=false/" $SETTINGS_FILE
            else
                OBFS_PASSWORD=$(tr -dc 'a-zA-Z0-9' </dev/urandom | fold -w 16 | head -n 1)
-               sed -i "s/OBFS_ENABLED=.*/OBFS_ENABLED=true/" $SETTINGS_FILE
-               grep -q "OBFS_PASSWORD" $SETTINGS_FILE && sed -i "s/OBFS_PASSWORD=.*/OBFS_PASSWORD=$OBFS_PASSWORD/" $SETTINGS_FILE || echo "OBFS_PASSWORD=$OBFS_PASSWORD" >> $SETTINGS_FILE
+               sed -i "s/^OBFS_ENABLED=.*/OBFS_ENABLED=true/" $SETTINGS_FILE
+               grep -q "OBFS_PASSWORD" $SETTINGS_FILE && sed -i "s/^OBFS_PASSWORD=.*/OBFS_PASSWORD=$OBFS_PASSWORD/" $SETTINGS_FILE || echo "OBFS_PASSWORD=$OBFS_PASSWORD" >> $SETTINGS_FILE
            fi
            ;;
         0) return ;;
         *) echo "Invalid choice." ; return ;;
     esac
     save_server_config
-    echo -e "${GREEN}Updated! Please update client links accordingly.${NC}"
+    echo -e "${GREEN}Updated! Please recreate client configs/QR codes (they use the new port links).${NC}"
 }
 
 # MAIN LOOP
-if [ -f "$BIN_PATH" ]; then
-    while true; do
-        echo -e "\n${BLUE}Hysteria 2 Manager${NC}"
-        echo "1) Add Client"
-        echo "2) List/QR Clients"
-        echo "3) Delete Client"
-        echo "4) Server Settings"
-        echo "5) Update Hysteria Core"
-        echo "6) Uninstall"
-        echo "0) Exit"
-        read -p "Choice: " MAIN_CHOICE
-        case $MAIN_CHOICE in
-            1) add_client ;;
-            2) list_clients ;;
-            3) delete_client ;;
-            4) modify_settings ;;
-            5) update_hysteria ;;
-            6) 
-               read -p "Are you sure? [y/N]: " CONFIRM
-               if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
-                   systemctl stop hysteria && systemctl disable hysteria
-                   rm -rf $HYSTERIA_DIR /etc/systemd/system/hysteria.service $BIN_PATH
-                   systemctl daemon-reload
-                   echo -e "${GREEN}Uninstalled.${NC}"
-                   break
-               fi
-               ;;
-            0) exit 0 ;;
-            *) echo -e "${RED}Invalid choice.${NC}" ;;
-        esac
-    done
-else
+if [ ! -f "$BIN_PATH" ]; then
     install_hysteria
 fi
+
+while true; do
+    echo -e "\n${BLUE}Hysteria 2 Manager${NC}"
+    echo "1) Add Client"
+    echo "2) List/QR Clients"
+    echo "3) Delete Client"
+    echo "4) Server Settings"
+    echo "5) Update Hysteria Core"
+    echo "6) Uninstall"
+    echo "0) Exit"
+    read -p "Choice: " MAIN_CHOICE
+    case $MAIN_CHOICE in
+        1) add_client ;;
+        2) list_clients ;;
+        3) delete_client ;;
+        4) modify_settings ;;
+        5) update_hysteria ;;
+        6) 
+           read -p "Are you sure? [y/N]: " CONFIRM
+           if [[ "$CONFIRM" =~ ^[Yy]$ ]]; then
+               systemctl stop hysteria && systemctl disable hysteria
+               rm -rf $HYSTERIA_DIR /etc/systemd/system/hysteria.service $BIN_PATH
+               systemctl daemon-reload
+               echo -e "${GREEN}Uninstalled.${NC}"
+               break
+           fi
+           ;;
+        0) exit 0 ;;
+        *) echo -e "${RED}Invalid choice.${NC}" ;;
+    esac
+done
