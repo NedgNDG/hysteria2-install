@@ -30,4 +30,4 @@ After installation, use `./hysteria-install.sh` to manage Hysteria2.
 
 ## Upgrading from older versions
 
-If you already have Hysteria installed via a previous version of this script, simply re-download and re-run it. Existing `settings.conf` files are backward-compatible — new fields (`HOP_METHOD`, `OBFS_TYPE`, `OBFS_MIN_PKT`, `OBFS_MAX_PKT`) will fall back to safe defaults. Use the **Server Settings** menu to enable Gecko obfuscation or switch to native port hopping on existing installations.
+If you already have Hysteria installed via a previous version of this script, simply re-download and re-run it. Existing `settings.conf` files are backward-compatible — new fields will fall back to safe defaults.
